@@ -88,5 +88,7 @@ Not able to properly transition from `In Progress` to `In Review` because there 
 ## ✅ Next Steps
 
 - Map status names to consistent lozenge colors (e.g., In Progress = blue, In Review = yellow).  
+- Transition to approved only when 100% of approvers have approved.
+- (Jira limitation) You can’t programmatically refresh the whole issue view
 - Optionally show *who* approved (names with lozenges) instead of only counts.  
-- Add Jira automation rule to notify admins when all approvers have approved.  
+- Add Jira automation rule to notify admins when all approvers have approved.  (not necessary to use forge here)
