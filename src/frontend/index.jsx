@@ -1,16 +1,8 @@
+//Libraries required for the application to work
 import React, { useEffect, useState, useCallback } from 'react';
-import ForgeReconciler, {
-  Button,
-  Text,
-  Stack,
-  SectionMessage,
-  Spinner,
-  useProductContext,
-  Lozenge
-} from '@forge/react';
+import ForgeReconciler, {Button,Text,Stack,SectionMessage,Spinner,useProductContext,Lozenge} from '@forge/react';
 import { requestJira, events } from '@forge/bridge';
 
-// --- Config: replace with your actual field IDs & workflow names ---
 const APPROVERS_FIELD_ID = 'customfield_10003';   // "Approvers" custom field
 const APPROVAL_DATE_FIELD_ID = 'customfield_10067'; // "Approval Date" custom field
 const REQUIRED_STATUS_NAME = 'In Review';         // Status where approval is allowed
