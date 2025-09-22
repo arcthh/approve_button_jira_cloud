@@ -1,88 +1,194 @@
+// src/resolvers/index.js
+// Backend resolvers for UI Kit 2.
+// - All Jira REST calls are made here (frontend invokes resolvers).
+// - Use api.asUser() so permissions & audit are attributed to the viewer.
+// - Approvers are read from a custom field; approval date written to another field.
+// - We also store "votes" in an issue property to count x/y approvals.
+
 import Resolver from '@forge/resolver';
 import api, { route } from '@forge/api';
 
-const APPROVER_CF = 'customfield_10063';      // update to your Approvers field
-const APPROVAL_DATE_CF = 'customfield_15694'; // update to your Approval Date field
-const APPROVAL_PROPERTY_KEY = 'approvalVotes';
-const REQUIRED_STATUS = 'In Review';
-const TARGET_STATUS = 'Approved';
-
 const resolver = new Resolver();
 
-// Gate check
+/**
+ * ====== CONFIGURE THESE FOR YOUR SITE ======
+ * Replace with your actual custom field IDs. You said you have different IDs already.
+ * You can discover IDs via /rest/api/3/issue/{key}?expand=names or your metadata calls.
+ */
+const APPROVER_CF = 'customfield_10063';      // <-- Approvers (multi-user picker) field ID
+const APPROVAL_DATE_CF = 'customfield_15694'; // <-- Approval Date (date/datetime) field ID
+
+/**
+ * Internal constants for workflow + storage.
+ * Adjust these names to match your Jira workflow.
+ */
+const REQUIRED_STATUS = 'In Review';  // Button appears only in this status
+const TARGET_STATUS = 'Approved';     // Status to move to on click
+const APPROVAL_PROPERTY_KEY = 'approvalVotes'; // Issue property to store who approved
+
+/**
+ * Utility: Given either an issueKey or issueId, return the issue JSON.
+ * Jira REST accepts either form in the /issue/{idOrKey} path, so we just pass what we have.
+ */
+async function getIssueByKeyOrId(idOrKey) {
+  const res = await api.asUser().requestJira(route`/rest/api/3/issue/${idOrKey}`);
+  if (!res.ok) throw new Error(`Issue fetch failed: HTTP ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Resolver: getIssueData
+ * Returns the UI "gate" model used by the frontend to render status, approvers,
+ * and to decide if the Approve button should show.
+ */
 resolver.define('getIssueData', async ({ payload }) => {
-  const { issueKey } = payload;
+  const idOrKey = payload.issueKey || payload.issueId;
+  if (!idOrKey) throw new Error('Missing issueKey/issueId in request.');
 
-  const issueRes = await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}`);
-  if (!issueRes.ok) throw new Error(`Issue fetch failed: ${issueRes.status}`);
-  const issue = await issueRes.json();
+  // 1) Load the issue
+  const issue = await getIssueByKeyOrId(idOrKey);
 
-  const statusName = issue?.fields?.status?.name;
-  const approvers = issue?.fields?.[APPROVER_CF] || [];
-
+  // 2) Who is the current user?
   const meRes = await api.asUser().requestJira(route`/rest/api/3/myself`);
+  if (!meRes.ok) throw new Error(`myself fetch failed: HTTP ${meRes.status}`);
   const me = await meRes.json();
 
-  // Get approval votes
-  const votesRes = await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}/properties/${APPROVAL_PROPERTY_KEY}`);
+  // 3) Read fields we care about
+  const statusName = issue?.fields?.status?.name || 'Unknown';
+
+  // Approvers is expected to be an array of user objects (multi-user picker).
+  // If the field is empty or misconfigured, normalize to [] so the UI is robust.
+  const approvers = Array.isArray(issue?.fields?.[APPROVER_CF])
+    ? issue.fields[APPROVER_CF]
+    : [];
+
+  // 4) Load approval "votes" from issue properties (array of accountIds)
   let votes = [];
-  if (votesRes.ok) {
-    const p = await votesRes.json();
+  const propRes = await api
+    .asUser()
+    .requestJira(route`/rest/api/3/issue/${issue.id}/properties/${APPROVAL_PROPERTY_KEY}`);
+  if (propRes.ok) {
+    const p = await propRes.json();
     votes = Array.isArray(p.value) ? p.value : [];
   }
+  const hasVoted = votes.includes(me.accountId);
+
+  // 5) Compute canApprove predicate:
+  //    - Status must be "In Review"
+  //    - At least one approver is set
+  //    - Current user is listed as an approver
+  const currentUserIsApprover = approvers.some((u) => u?.accountId === me.accountId);
+  const canApprove =
+    statusName === REQUIRED_STATUS && approvers.length > 0 && currentUserIsApprover;
 
   return {
     statusName,
-    approvers,
-    me,
-    approvedCount: votes.length,
+    approvers,                       // array of {displayName, accountId, ...}
+    approvedCount: votes.length,     // how many unique approvers have clicked Approve
     totalApprovers: approvers.length,
-    hasVoted: votes.includes(me.accountId),
-    canApprove: statusName === REQUIRED_STATUS && approvers.some(a => a.accountId === me.accountId),
+    hasVoted,
+    canApprove,
   };
 });
 
-// Approve action
+/**
+ * Resolver: approveIssue
+ * Performs the workflow transition and writes approval date + vote.
+ * Runs as the viewing user (asUser), so normal Jira permissions apply.
+ */
 resolver.define('approveIssue', async ({ payload }) => {
-  const { issueKey } = payload;
+  const idOrKey = payload.issueKey || payload.issueId;
+  if (!idOrKey) throw new Error('Missing issueKey/issueId in request.');
 
+  // Identify user (for vote storage and message)
   const meRes = await api.asUser().requestJira(route`/rest/api/3/myself`);
+  if (!meRes.ok) throw new Error(`myself fetch failed: HTTP ${meRes.status}`);
   const me = await meRes.json();
 
-  // Transition
-  const transRes = await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}/transitions`);
-  const trans = (await transRes.json())?.transitions || [];
-  const target = trans.find(t => t.to?.name?.toLowerCase() === TARGET_STATUS.toLowerCase());
-  if (!target) throw new Error(`No transition to "${TARGET_STATUS}" available.`);
+  // Read the issue to validate status + approvers server-side
+  const issue = await getIssueByKeyOrId(idOrKey);
+  const statusName = issue?.fields?.status?.name || 'Unknown';
+  const approvers = Array.isArray(issue?.fields?.[APPROVER_CF])
+    ? issue.fields[APPROVER_CF]
+    : [];
+  const currentUserIsApprover = approvers.some((u) => u?.accountId === me.accountId);
 
-  await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}/transitions`, {
+  if (statusName !== REQUIRED_STATUS) {
+    throw new Error(`Issue must be in "${REQUIRED_STATUS}" to approve (current: "${statusName}").`);
+  }
+  if (approvers.length === 0 || !currentUserIsApprover) {
+    throw new Error('Only listed approvers can approve this issue.');
+  }
+
+  // OPTIONAL RULE (commented): Require 100% approvals before transition.
+  // If you want to enforce this server-side, uncomment this block.
+  /*
+  // Load current votes
+  let votes = [];
+  const vGet = await api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/properties/${APPROVAL_PROPERTY_KEY}`);
+  if (vGet.ok) {
+    const p = await vGet.json();
+    votes = Array.isArray(p.value) ? p.value : [];
+  }
+  const uniqueVotes = new Set(votes);
+  uniqueVotes.add(me.accountId);
+  if (uniqueVotes.size < approvers.length) {
+    throw new Error(`All approvers must approve before transition. (${uniqueVotes.size}/${approvers.length})`);
+  }
+  */
+
+  // 1) Find a transition that leads to the TARGET_STATUS
+  const transRes = await api
+    .asUser()
+    .requestJira(route`/rest/api/3/issue/${issue.id}/transitions`);
+  if (!transRes.ok) throw new Error(`Transitions fetch failed: HTTP ${transRes.status}`);
+  const transitions = (await transRes.json())?.transitions || [];
+  const target = transitions.find(
+    (t) => String(t?.to?.name || '').toLowerCase() === TARGET_STATUS.toLowerCase()
+  );
+  if (!target) {
+    throw new Error(`No workflow transition to "${TARGET_STATUS}" is currently available.`);
+  }
+
+  // 2) Perform the transition
+  const doTrans = await api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/transitions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ transition: { id: target.id } })
+    body: JSON.stringify({ transition: { id: target.id } }),
   });
+  if (!doTrans.ok) throw new Error(`Transition failed: HTTP ${doTrans.status}`);
 
-  // Set approval date
-  const now = new Date().toISOString();
-  await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}`, {
+  // 3) Set Approval Date (ISO 8601). Jira date/datetime fields accept ISO strings.
+  const nowIso = new Date().toISOString();
+  const upd = await api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fields: { [APPROVAL_DATE_CF]: now } })
+    body: JSON.stringify({
+      fields: {
+        [APPROVAL_DATE_CF]: nowIso,
+      },
+    }),
   });
+  if (!upd.ok) throw new Error(`Setting "Approval Date" failed: HTTP ${upd.status}`);
 
-  // Update votes
+  // 4) Record the user’s approval vote in the issue property (tally for x/y display)
   let votes = [];
-  const propGet = await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}/properties/${APPROVAL_PROPERTY_KEY}`);
-  if (propGet.ok) {
-    const p = await propGet.json();
+  const vGet = await api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/properties/${APPROVAL_PROPERTY_KEY}`);
+  if (vGet.ok) {
+    const p = await vGet.json();
     votes = Array.isArray(p.value) ? p.value : [];
   }
   if (!votes.includes(me.accountId)) votes.push(me.accountId);
 
-  await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}/properties/${APPROVAL_PROPERTY_KEY}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(votes)
-  });
+  const vPut = await api.asUser().requestJira(
+    route`/rest/api/3/issue/${issue.id}/properties/${APPROVAL_PROPERTY_KEY}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(votes),
+    }
+  );
+  if (!vPut.ok) throw new Error(`Storing approval vote failed: HTTP ${vPut.status}`);
 
   return { message: `Approved by ${me.displayName}` };
 });
