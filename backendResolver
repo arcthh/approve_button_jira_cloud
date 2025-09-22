@@ -1,0 +1,90 @@
+import Resolver from '@forge/resolver';
+import api, { route } from '@forge/api';
+
+const APPROVER_CF = 'customfield_10063';      // update to your Approvers field
+const APPROVAL_DATE_CF = 'customfield_15694'; // update to your Approval Date field
+const APPROVAL_PROPERTY_KEY = 'approvalVotes';
+const REQUIRED_STATUS = 'In Review';
+const TARGET_STATUS = 'Approved';
+
+const resolver = new Resolver();
+
+// Gate check
+resolver.define('getIssueData', async ({ payload }) => {
+  const { issueKey } = payload;
+
+  const issueRes = await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}`);
+  if (!issueRes.ok) throw new Error(`Issue fetch failed: ${issueRes.status}`);
+  const issue = await issueRes.json();
+
+  const statusName = issue?.fields?.status?.name;
+  const approvers = issue?.fields?.[APPROVER_CF] || [];
+
+  const meRes = await api.asUser().requestJira(route`/rest/api/3/myself`);
+  const me = await meRes.json();
+
+  // Get approval votes
+  const votesRes = await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}/properties/${APPROVAL_PROPERTY_KEY}`);
+  let votes = [];
+  if (votesRes.ok) {
+    const p = await votesRes.json();
+    votes = Array.isArray(p.value) ? p.value : [];
+  }
+
+  return {
+    statusName,
+    approvers,
+    me,
+    approvedCount: votes.length,
+    totalApprovers: approvers.length,
+    hasVoted: votes.includes(me.accountId),
+    canApprove: statusName === REQUIRED_STATUS && approvers.some(a => a.accountId === me.accountId),
+  };
+});
+
+// Approve action
+resolver.define('approveIssue', async ({ payload }) => {
+  const { issueKey } = payload;
+
+  const meRes = await api.asUser().requestJira(route`/rest/api/3/myself`);
+  const me = await meRes.json();
+
+  // Transition
+  const transRes = await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}/transitions`);
+  const trans = (await transRes.json())?.transitions || [];
+  const target = trans.find(t => t.to?.name?.toLowerCase() === TARGET_STATUS.toLowerCase());
+  if (!target) throw new Error(`No transition to "${TARGET_STATUS}" available.`);
+
+  await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}/transitions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transition: { id: target.id } })
+  });
+
+  // Set approval date
+  const now = new Date().toISOString();
+  await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields: { [APPROVAL_DATE_CF]: now } })
+  });
+
+  // Update votes
+  let votes = [];
+  const propGet = await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}/properties/${APPROVAL_PROPERTY_KEY}`);
+  if (propGet.ok) {
+    const p = await propGet.json();
+    votes = Array.isArray(p.value) ? p.value : [];
+  }
+  if (!votes.includes(me.accountId)) votes.push(me.accountId);
+
+  await api.asUser().requestJira(route`/rest/api/3/issue/${issueKey}/properties/${APPROVAL_PROPERTY_KEY}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(votes)
+  });
+
+  return { message: `Approved by ${me.displayName}` };
+});
+
+export const handler = resolver.getDefinitions();
