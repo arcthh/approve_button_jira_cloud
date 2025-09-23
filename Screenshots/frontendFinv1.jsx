@@ -7,138 +7,81 @@ import ForgeReconciler, {
   Lozenge,
   SectionMessage,
 } from '@forge/react';
-import { invoke } from '@forge/bridge';
+import { invoke, view } from '@forge/bridge';
 
 /**
- * UI Kit 2 issueContext frontend:
- * - Displays status, approvers, "Approval given by" and the Approve button.
- * - Subscribes to JIRA_ISSUE_CHANGED (debounced) and falls back to light polling.
- * - On issue changes, calls normalizeOnReady() (backend) to reset fields when status returns to "Ready for Review",
- *   then re-fetches gate data to update UI. This avoids manual refresh.
+ * Fast, stable UI Kit 2 frontend:
+ * - Only shows a big "Loading…" during the very first fetch.
+ * - Subsequent refreshes are "silent" (no spinner flicker).
+ * - Subscribes to JIRA_ISSUE_CHANGED via view.on (no polling).
+ * - Debounces event bursts and prevents overlapping fetches.
+ * - Does NOT call normalize-on-every-event (that can cause loops). We’ll reset on reopen in the backend on demand.
  */
 
 function App() {
-  // Jira context for this placement (confirmed from your dump)
   const productCtx = useProductContext();
   const issueKey = productCtx?.extension?.issue?.key || null;
   const issueId  = productCtx?.extension?.issue?.id  || null;
 
-  // View-model state
-  const [loading, setLoading]       = useState(true);
-  const [gate, setGate]             = useState(null);
-  const [error, setError]           = useState(null);
-  const [approving, setApproving]   = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true); // only for first load
+  const [gate, setGate]                     = useState(null);
+  const [error, setError]                   = useState(null);
+  const [approving, setApproving]           = useState(false);
 
-  // ---- Helpers ----------------------------------------------------------------
+  // prevent concurrent fetches & throttle refreshes
+  const inFlightRef = useRef(false);
+  const lastFetchMs = useRef(0);
+  const DEBOUNCE_MS = 400;
 
-  // Fetch the current "gate" model (status, approvers, votes, approval fields)
   const fetchGate = async () => {
-    if (!issueKey && !issueId) return; // context not ready yet
-    setError(null);
+    if (!issueKey && !issueId) return;
+    if (inFlightRef.current) return; // skip if a fetch is already running
+
+    const now = Date.now();
+    if (now - lastFetchMs.current < DEBOUNCE_MS) return; // throttle bursts
+    lastFetchMs.current = now;
+
+    inFlightRef.current = true;
     try {
-      setLoading(true);
       const data = await invoke('getIssueData', { issueKey, issueId });
       setGate(data);
+      setError(null);
     } catch (e) {
       setError(e?.message || String(e));
     } finally {
-      setLoading(false);
+      inFlightRef.current = false;
+      if (initialLoading) setInitialLoading(false);
     }
   };
 
-  // Debounce utility to prevent bursty refresh (e.g., multiple field updates during a transition)
-  const debounceRef = useRef(null);
-  const debounce = (fn, ms = 400) => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(fn, ms);
-  };
-
-  // Keep track of the last refresh time to avoid tight loops
-  const lastRefreshTsRef = useRef(0);
-  const safeRefresh = async () => {
-    const now = Date.now();
-    if (now - lastRefreshTsRef.current < 400) return; // guard: max ~2.5Hz
-    lastRefreshTsRef.current = now;
-    await fetchGate();
-  };
-
-  // ---- Lifecycle wiring -------------------------------------------------------
-
-  // Initial fetch and whenever identity changes
+  // First load + when identity changes
   useEffect(() => {
+    setInitialLoading(true);
     fetchGate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [issueKey, issueId]);
 
-  // Subscribe to JIRA_ISSUE_CHANGED if available; otherwise use gentle polling
+  // Event-driven refresh (no polling). If your runtime didn’t support view.on previously,
+  // that usually manifested as a blank screen. Here it’s safe and minimal.
   useEffect(() => {
     if (!issueKey && !issueId) return;
-
-    let unmounted = false;
-    let removeListener = null;
-    let pollTimer = null;
-
-    (async () => {
-      try {
-        // Dynamic import so the UI doesn't fail on tenants where view API isn't present/stable
-        const mod = await import('@forge/bridge');
-        const view = mod?.view;
-
-        if (view && typeof view.on === 'function') {
-          const handler = async () => {
-            // On any issue change:
-            // 1) Ask backend to normalize fields if status is "Ready for Review"
-            // 2) Re-fetch gate (debounced to avoid bursts)
-            try {
-              await invoke('normalizeOnReady', { issueKey, issueId });
-            } catch (_) {
-              // ignore normalize errors; we'll still refresh
-            }
-            debounce(safeRefresh, 400);
-          };
-
-          view.on('JIRA_ISSUE_CHANGED', handler);
-          removeListener = () => {
-            try {
-              if (typeof view.off === 'function') view.off('JIRA_ISSUE_CHANGED', handler);
-              // some runtimes only support .removeListener
-              if (typeof view.removeListener === 'function') {
-                view.removeListener('JIRA_ISSUE_CHANGED', handler);
-              }
-            } catch (_) {}
-          };
-          return; // we subscribed successfully; skip polling
-        }
-      } catch {
-        // no-op; fall through to polling
-      }
-
-      // Fallback: poll every 5s while mounted and identity known
-      if (!unmounted) {
-        pollTimer = setInterval(() => {
-          if (issueKey || issueId) safeRefresh();
-        }, 5000);
-      }
-    })();
-
+    const onChanged = () => fetchGate();
+    view.on('JIRA_ISSUE_CHANGED', onChanged);
     return () => {
-      unmounted = true;
-      if (removeListener) removeListener();
-      if (pollTimer) clearInterval(pollTimer);
-      if (debounceRef.current) clearTimeout(debounceRef.current);
+      try {
+        if (typeof view.off === 'function') view.off('JIRA_ISSUE_CHANGED', onChanged);
+        if (typeof view.removeListener === 'function') view.removeListener('JIRA_ISSUE_CHANGED', onChanged);
+      } catch {}
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [issueKey, issueId]);
 
-  // Approve click → transition + set fields + vote → refresh
   const onApprove = async () => {
     setApproving(true);
-    setError(null);
     try {
-      const resp = await invoke('approveIssue', { issueKey, issueId });
-      // optimistic message (resolver also returns message)
-      setGate((prev) => (prev ? { ...prev, message: resp?.message } : prev));
-      await safeRefresh(); // sync with server state after mutation
+      await invoke('approveIssue', { issueKey, issueId });
+      // Fetch once after mutation; further workflow/automation updates will come via the event.
+      await fetchGate();
     } catch (e) {
       setError(e?.message || String(e));
     } finally {
@@ -146,9 +89,7 @@ function App() {
     }
   };
 
-  // ---- Render -----------------------------------------------------------------
-
-  if (loading || !gate) return <Text>Loading…</Text>;
+  if (initialLoading || !gate) return <Text>Loading…</Text>;
 
   return (
     <Stack space="medium">
@@ -169,7 +110,7 @@ function App() {
       {/* Approvers row */}
       <Stack direction="horizontal" align="center" space="small">
         <Text>Approvers:</Text>
-        {gate.approvers?.length > 0 ? (
+        {gate.approvers?.length ? (
           gate.approvers.map((u, i) => (
             <Lozenge key={i} appearance="new">
               {u.displayName}
@@ -180,7 +121,7 @@ function App() {
         )}
       </Stack>
 
-      {/* Approval given by (single user custom field) */}
+      {/* Approval given by */}
       <Stack direction="horizontal" align="center" space="small">
         <Text>Approval given by:</Text>
         {gate.approvalGivenBy ? (
@@ -190,7 +131,7 @@ function App() {
         )}
       </Stack>
 
-      {/* Approval date (optional display) */}
+      {/* Approval date (if you want to show it) */}
       {gate.approvalDate && (
         <Stack direction="horizontal" align="center" space="small">
           <Text>Approval date:</Text>
@@ -198,7 +139,7 @@ function App() {
         </Stack>
       )}
 
-      {/* Main action/state */}
+      {/* Action/state */}
       {gate.statusName === 'Approved' ? (
         <SectionMessage appearance="success" title="Approved">
           <Text>
@@ -213,10 +154,7 @@ function App() {
         </Button>
       ) : (
         <SectionMessage appearance="warning" title="Approval not available">
-          <Text>
-            Approve shows only in “Ready for Review”, with approvers set, and when you are one of
-            them.
-          </Text>
+          <Text>Available only in “Ready for Review”, with approvers set, and if you are one of them.</Text>
         </SectionMessage>
       )}
     </Stack>
