@@ -10,12 +10,12 @@ import ForgeReconciler, {
 import { invoke, view } from '@forge/bridge';
 
 /**
- * Fast, stable UI Kit 2 frontend:
- * - Only shows a big "Loading…" during the very first fetch.
- * - Subsequent refreshes are "silent" (no spinner flicker).
- * - Subscribes to JIRA_ISSUE_CHANGED via view.on (no polling).
- * - Debounces event bursts and prevents overlapping fetches.
- * - Does NOT call normalize-on-every-event (that can cause loops). We’ll reset on reopen in the backend on demand.
+ * Quiet, fast UI Kit 2 frontend:
+ * - No polling
+ * - First-load spinner only; later refreshes are silent
+ * - Single-flight fetch guard
+ * - Throttle (min gap) + debounce on events
+ * - Rate-limit backoff on 429
  */
 
 function App() {
@@ -23,65 +23,95 @@ function App() {
   const issueKey = productCtx?.extension?.issue?.key || null;
   const issueId  = productCtx?.extension?.issue?.id  || null;
 
-  const [initialLoading, setInitialLoading] = useState(true); // only for first load
-  const [gate, setGate]                     = useState(null);
-  const [error, setError]                   = useState(null);
-  const [approving, setApproving]           = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [gate, setGate] = useState(null);
+  const [error, setError] = useState(null);
+  const [approving, setApproving] = useState(false);
 
-  // prevent concurrent fetches & throttle refreshes
+  // single-flight & throttling
   const inFlightRef = useRef(false);
   const lastFetchMs = useRef(0);
-  const DEBOUNCE_MS = 400;
+  const debounceTimer = useRef(null);
+  const subscribed = useRef(false);
 
-  const fetchGate = async () => {
+  // tune these if needed
+  const MIN_GAP_MS = 1200;         // hard throttle between fetches
+  const EVENT_DEBOUNCE_MS = 600;   // debounce for bursts of issue-change events
+  const RL_BACKOFF_MS = 3000;      // wait after a 429 before retrying once
+
+  const doFetch = async (opts = { isInitial: false, retryOn429: true }) => {
     if (!issueKey && !issueId) return;
-    if (inFlightRef.current) return; // skip if a fetch is already running
 
     const now = Date.now();
-    if (now - lastFetchMs.current < DEBOUNCE_MS) return; // throttle bursts
-    lastFetchMs.current = now;
+    if (now - lastFetchMs.current < MIN_GAP_MS) return; // throttle
+    if (inFlightRef.current) return;                    // single-flight
 
     inFlightRef.current = true;
     try {
       const data = await invoke('getIssueData', { issueKey, issueId });
       setGate(data);
       setError(null);
+      lastFetchMs.current = Date.now();
     } catch (e) {
-      setError(e?.message || String(e));
+      const msg = e?.message || String(e);
+      setError(msg);
+
+      // crude detection of rate-limit; retry exactly once after cooldown
+      const looks429 = /429|too many requests/i.test(msg);
+      if (opts.retryOn429 && looks429) {
+        setTimeout(() => {
+          // one retry; pass retryOn429: false
+          doFetch({ isInitial: false, retryOn429: false });
+        }, RL_BACKOFF_MS);
+      }
     } finally {
       inFlightRef.current = false;
-      if (initialLoading) setInitialLoading(false);
+      if (opts.isInitial) setInitialLoading(false);
     }
   };
 
   // First load + when identity changes
   useEffect(() => {
     setInitialLoading(true);
-    fetchGate();
+    doFetch({ isInitial: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [issueKey, issueId]);
 
-  // Event-driven refresh (no polling). If your runtime didn’t support view.on previously,
-  // that usually manifested as a blank screen. Here it’s safe and minimal.
+  // Subscribe to JIRA_ISSUE_CHANGED; debounce + throttle the refetch
   useEffect(() => {
     if (!issueKey && !issueId) return;
-    const onChanged = () => fetchGate();
-    view.on('JIRA_ISSUE_CHANGED', onChanged);
+    if (subscribed.current) return;
+
+    const onChanged = () => {
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      debounceTimer.current = setTimeout(() => doFetch({ isInitial: false }), EVENT_DEBOUNCE_MS);
+    };
+
+    try {
+      view.on('JIRA_ISSUE_CHANGED', onChanged);
+      subscribed.current = true;
+    } catch (_e) {
+      // If view is not available, we simply won't auto-refresh; user action (approve) still refreshes.
+    }
+
     return () => {
       try {
         if (typeof view.off === 'function') view.off('JIRA_ISSUE_CHANGED', onChanged);
         if (typeof view.removeListener === 'function') view.removeListener('JIRA_ISSUE_CHANGED', onChanged);
       } catch {}
+      subscribed.current = false;
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [issueKey, issueId]);
 
   const onApprove = async () => {
     setApproving(true);
+    setError(null);
     try {
-      await invoke('approveIssue', { issueKey, issueId });
-      // Fetch once after mutation; further workflow/automation updates will come via the event.
-      await fetchGate();
+      const resp = await invoke('approveIssue', { issueKey, issueId });
+      setGate((prev) => (prev ? { ...prev, message: resp?.message } : prev));
+      await doFetch({ isInitial: false }); // one fetch after mutation
     } catch (e) {
       setError(e?.message || String(e));
     } finally {
@@ -131,7 +161,7 @@ function App() {
         )}
       </Stack>
 
-      {/* Approval date (if you want to show it) */}
+      {/* Approval date */}
       {gate.approvalDate && (
         <Stack direction="horizontal" align="center" space="small">
           <Text>Approval date:</Text>
