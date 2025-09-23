@@ -10,15 +10,15 @@ import ForgeReconciler, {
 import { invoke, view } from '@forge/bridge';
 
 /**
- * Quiet, fast UI Kit 2 frontend:
- * - No polling
- * - First-load spinner only; later refreshes are silent
- * - Single-flight fetch guard
- * - Throttle (min gap) + debounce on events
- * - Rate-limit backoff on 429
+ * Lean UI:
+ * - Only shows a spinner on first load
+ * - Single-flight fetch (no overlapping calls)
+ * - Debounced event refresh via JIRA_ISSUE_CHANGED
+ * - No debug panes, no polling
  */
 
 function App() {
+  // From your context dump
   const productCtx = useProductContext();
   const issueKey = productCtx?.extension?.issue?.key || null;
   const issueId  = productCtx?.extension?.issue?.id  || null;
@@ -28,23 +28,18 @@ function App() {
   const [error, setError] = useState(null);
   const [approving, setApproving] = useState(false);
 
-  // single-flight & throttling
+  // Prevent overlapping fetches + light throttling
   const inFlightRef = useRef(false);
   const lastFetchMs = useRef(0);
   const debounceTimer = useRef(null);
-  const subscribed = useRef(false);
 
-  // tune these if needed
-  const MIN_GAP_MS = 1200;         // hard throttle between fetches
-  const EVENT_DEBOUNCE_MS = 600;   // debounce for bursts of issue-change events
-  const RL_BACKOFF_MS = 3000;      // wait after a 429 before retrying once
+  const MIN_GAP_MS = 800;   // minimum gap between fetches
+  const EVENT_DEBOUNCE_MS = 400;
 
-  const doFetch = async (opts = { isInitial: false, retryOn429: true }) => {
+  const fetchGate = async (isInitial = false) => {
     if (!issueKey && !issueId) return;
-
     const now = Date.now();
-    if (now - lastFetchMs.current < MIN_GAP_MS) return; // throttle
-    if (inFlightRef.current) return;                    // single-flight
+    if (inFlightRef.current || now - lastFetchMs.current < MIN_GAP_MS) return;
 
     inFlightRef.current = true;
     try {
@@ -53,53 +48,35 @@ function App() {
       setError(null);
       lastFetchMs.current = Date.now();
     } catch (e) {
-      const msg = e?.message || String(e);
-      setError(msg);
-
-      // crude detection of rate-limit; retry exactly once after cooldown
-      const looks429 = /429|too many requests/i.test(msg);
-      if (opts.retryOn429 && looks429) {
-        setTimeout(() => {
-          // one retry; pass retryOn429: false
-          doFetch({ isInitial: false, retryOn429: false });
-        }, RL_BACKOFF_MS);
-      }
+      setError(e?.message || String(e));
     } finally {
       inFlightRef.current = false;
-      if (opts.isInitial) setInitialLoading(false);
+      if (isInitial) setInitialLoading(false);
     }
   };
 
-  // First load + when identity changes
+  // Initial load & when the identity changes
   useEffect(() => {
     setInitialLoading(true);
-    doFetch({ isInitial: true });
+    fetchGate(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [issueKey, issueId]);
 
-  // Subscribe to JIRA_ISSUE_CHANGED; debounce + throttle the refetch
+  // Auto-refresh on Jira changes (debounced)
   useEffect(() => {
     if (!issueKey && !issueId) return;
-    if (subscribed.current) return;
-
     const onChanged = () => {
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
-      debounceTimer.current = setTimeout(() => doFetch({ isInitial: false }), EVENT_DEBOUNCE_MS);
+      debounceTimer.current = setTimeout(() => fetchGate(false), EVENT_DEBOUNCE_MS);
     };
-
     try {
       view.on('JIRA_ISSUE_CHANGED', onChanged);
-      subscribed.current = true;
-    } catch (_e) {
-      // If view is not available, we simply won't auto-refresh; user action (approve) still refreshes.
-    }
-
+    } catch {}
     return () => {
       try {
         if (typeof view.off === 'function') view.off('JIRA_ISSUE_CHANGED', onChanged);
         if (typeof view.removeListener === 'function') view.removeListener('JIRA_ISSUE_CHANGED', onChanged);
       } catch {}
-      subscribed.current = false;
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -110,8 +87,9 @@ function App() {
     setError(null);
     try {
       const resp = await invoke('approveIssue', { issueKey, issueId });
+      // show the backend message briefly; a fetch right after keeps us in sync
       setGate((prev) => (prev ? { ...prev, message: resp?.message } : prev));
-      await doFetch({ isInitial: false }); // one fetch after mutation
+      await fetchGate(false);
     } catch (e) {
       setError(e?.message || String(e));
     } finally {
@@ -129,7 +107,7 @@ function App() {
         </SectionMessage>
       )}
 
-      {/* Status row */}
+      {/* Status */}
       <Stack direction="horizontal" align="center" space="small">
         <Text>Status:</Text>
         <Lozenge appearance={gate.statusName === 'Approved' ? 'success' : 'inprogress'}>
@@ -137,7 +115,7 @@ function App() {
         </Lozenge>
       </Stack>
 
-      {/* Approvers row */}
+      {/* Approvers */}
       <Stack direction="horizontal" align="center" space="small">
         <Text>Approvers:</Text>
         {gate.approvers?.length ? (
@@ -161,7 +139,7 @@ function App() {
         )}
       </Stack>
 
-      {/* Approval date */}
+      {/* Approval date (shows raw value from Jira) */}
       {gate.approvalDate && (
         <Stack direction="horizontal" align="center" space="small">
           <Text>Approval date:</Text>
@@ -169,7 +147,7 @@ function App() {
         </Stack>
       )}
 
-      {/* Action/state */}
+      {/* Main action/state */}
       {gate.statusName === 'Approved' ? (
         <SectionMessage appearance="success" title="Approved">
           <Text>
@@ -184,7 +162,9 @@ function App() {
         </Button>
       ) : (
         <SectionMessage appearance="warning" title="Approval not available">
-          <Text>Available only in “Ready for Review”, with approvers set, and if you are one of them.</Text>
+          <Text>
+            Available only in “Ready for Review”, with approvers set, and when you are one of them.
+          </Text>
         </SectionMessage>
       )}
     </Stack>
