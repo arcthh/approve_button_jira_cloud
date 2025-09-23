@@ -1,4 +1,3 @@
-// src/resolvers/index.js
 import Resolver from '@forge/resolver';
 import api, { route } from '@forge/api';
 
@@ -15,14 +14,29 @@ async function assertOk(res, label) {
   if (!res.ok) throw new Error(`${label} failed: ${res.status} ${await res.text()}`);
   return res;
 }
+
+// Fetch ONLY the fields we need to render the panel.
+// This reduces response size and pressure on Jira.
 async function getIssueByKeyOrId(idOrKey) {
-  const res = await assertOk(api.asUser().requestJira(route`/rest/api/3/issue/${idOrKey}`), 'Issue fetch');
+  const fields = [
+    'status',
+    APPROVER_CF,
+    APPROVAL_DATE_CF,
+    APPROVAL_GIVEN_BY_CF,
+  ].join(',');
+  const res = await api.asUser().requestJira(
+    route`/rest/api/3/issue/${idOrKey}?fields=${fields}`
+  );
+  await assertOk(res, 'Issue fetch');
   return res.json();
 }
+
 async function getMyself() {
-  const res = await assertOk(api.asUser().requestJira(route`/rest/api/3/myself`), 'myself fetch');
+  const res = await api.asUser().requestJira(route`/rest/api/3/myself`);
+  await assertOk(res, 'myself fetch');
   return res.json();
 }
+
 async function getIssuePropertyOrEmpty(issueId, key) {
   const res = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}/properties/${key}`);
   if (res.status === 404) return [];
@@ -30,6 +44,7 @@ async function getIssuePropertyOrEmpty(issueId, key) {
   const p = await res.json();
   return Array.isArray(p.value) ? p.value : [];
 }
+
 async function putIssueProperty(issueId, key, value) {
   const res = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}/properties/${key}`, {
     method: 'PUT',
@@ -38,6 +53,7 @@ async function putIssueProperty(issueId, key, value) {
   });
   await assertOk(res, 'Property PUT');
 }
+
 async function updateIssueFields(issueId, fieldsObj) {
   const res = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}`, {
     method: 'PUT',
@@ -77,7 +93,7 @@ resolver.define('getIssueData', async ({ payload }) => {
   };
 });
 
-// Transition + write fields + vote
+// Transition + fields + vote
 resolver.define('approveIssue', async ({ payload }) => {
   const idOrKey = payload.issueKey || payload.issueId;
   if (!idOrKey) throw new Error('Missing issueKey/issueId');
@@ -95,12 +111,14 @@ resolver.define('approveIssue', async ({ payload }) => {
     throw new Error('Only listed approvers can approve this issue');
   }
 
-  const transRes = await assertOk(api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/transitions`), 'Transitions fetch');
-  const transitions = (await transRes.json())?.transitions || [];
+  // Find transition → Approved
+  const trRes = await api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/transitions`);
+  await assertOk(trRes, 'Transitions fetch');
+  const transitions = (await trRes.json())?.transitions || [];
   const availableTargets = transitions.map(t => t?.to?.name).filter(Boolean);
-  const target = transitions.find(t => String(t?.to?.name || '').toLowerCase() === TARGET_STATUS.toLowerCase());
+  const target = transitions.find(t => String(t?.to?.name || '').toLowerCase() === 'approved');
   if (!target) {
-    throw new Error(`No transition to "${TARGET_STATUS}" from "${statusName}". Available: ${availableTargets.join(', ') || '(none)'}`);
+    throw new Error(`No transition to "Approved" from "${statusName}". Available: ${availableTargets.join(', ') || '(none)'}`);
   }
 
   await assertOk(api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/transitions`, {
@@ -109,12 +127,14 @@ resolver.define('approveIssue', async ({ payload }) => {
     body: JSON.stringify({ transition: { id: target.id } }),
   }), 'Transition');
 
-  const nowIso = new Date().toISOString(); // if date-only field, convert to YYYY-MM-DD
+  // Write fields (ISO for datetime; switch to YYYY-MM-DD if your field is date-only)
+  const nowIso = new Date().toISOString();
   await updateIssueFields(issue.id, {
     [APPROVAL_DATE_CF]: nowIso,
     [APPROVAL_GIVEN_BY_CF]: { accountId: me.accountId },
   });
 
+  // Record vote
   const votes = await getIssuePropertyOrEmpty(issue.id, APPROVAL_PROPERTY_KEY);
   if (!votes.includes(me.accountId)) {
     votes.push(me.accountId);
@@ -125,10 +145,8 @@ resolver.define('approveIssue', async ({ payload }) => {
 });
 
 /**
- * resetApprovalOnReady:
- * Call this (manually or via automation) to clear approval artifacts when the
- * issue re-enters "Ready for Review". We do NOT call this on every event automatically
- * to avoid refresh loops and extra write load.
+ * Optional helper you can call from automation or a small UI control
+ * when the issue re-enters "Ready for Review" to clear approval artifacts.
  */
 resolver.define('resetApprovalOnReady', async ({ payload }) => {
   const idOrKey = payload.issueKey || payload.issueId;
@@ -140,7 +158,6 @@ resolver.define('resetApprovalOnReady', async ({ payload }) => {
     return { reset: false, reason: `Status is ${statusName}` };
   }
 
-  // Clear fields + votes if any are set
   const currentDate  = issue?.fields?.[APPROVAL_DATE_CF] || null;
   const currentBy    = issue?.fields?.[APPROVAL_GIVEN_BY_CF] || null;
   const votes        = await getIssuePropertyOrEmpty(issue.id, APPROVAL_PROPERTY_KEY);
