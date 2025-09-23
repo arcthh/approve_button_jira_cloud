@@ -3,21 +3,23 @@ import api, { route } from '@forge/api';
 
 const resolver = new Resolver();
 
-// Custom field IDs (update if your site uses different ones)
-const APPROVER_CF = 'customfield_10003';      // Approvers field (multi-user picker)
-const APPROVAL_DATE_CF = 'customfield_15694'; // Approval Date field
-const REQUIRED_STATUS = 'Ready for review';   // Show button only in this status
-const TARGET_STATUS = 'Approved';             // Transition target status
-const APPROVAL_PROPERTY_KEY = 'approvalVotes'; // Issue property for x/y votes
+// Your field IDs
+const APPROVER_CF = 'customfield_10003';      // Approvers
+const APPROVAL_DATE_CF = 'customfield_15694'; // Approval Date
 
-// Utility: get issue by id or key
+// Exact status name
+const REQUIRED_STATUS = 'Ready for Review';
+const TARGET_STATUS   = 'Approved';
+
+const APPROVAL_PROPERTY_KEY = 'approvalVotes';
+
+// Helpers
 async function getIssueByKeyOrId(idOrKey) {
   const res = await api.asUser().requestJira(route`/rest/api/3/issue/${idOrKey}`);
   if (!res.ok) throw new Error(`Issue fetch failed: ${res.status} ${await res.text()}`);
   return res.json();
 }
 
-// Utility: get issue property safely (treat 404 as empty array)
 async function getIssuePropertyOrEmpty(issueId, key) {
   const res = await api.asUser().requestJira(route`/rest/api/3/issue/${issueId}/properties/${key}`);
   if (res.status === 404) return [];
@@ -26,97 +28,87 @@ async function getIssuePropertyOrEmpty(issueId, key) {
   return Array.isArray(p.value) ? p.value : [];
 }
 
-// Resolver: fetch data for frontend
+// Gate/data for UI
 resolver.define('getIssueData', async ({ payload }) => {
   const idOrKey = payload.issueKey || payload.issueId;
-  if (!idOrKey) throw new Error('Missing issueKey/issueId in request');
+  if (!idOrKey) throw new Error('Missing issueKey/issueId');
 
   const issue = await getIssueByKeyOrId(idOrKey);
 
-  // Current user info
   const meRes = await api.asUser().requestJira(route`/rest/api/3/myself`);
   const me = await meRes.json();
 
   const statusName = issue?.fields?.status?.name || 'Unknown';
-  const approvers = Array.isArray(issue?.fields?.[APPROVER_CF])
-    ? issue.fields[APPROVER_CF]
-    : [];
+  const approvers  = Array.isArray(issue?.fields?.[APPROVER_CF]) ? issue.fields[APPROVER_CF] : [];
 
-  // Current votes
   const votes = await getIssuePropertyOrEmpty(issue.id, APPROVAL_PROPERTY_KEY);
-  const hasVoted = votes.includes(me.accountId);
 
-  // Can approve? Must be correct status + in approvers list
-  const currentUserIsApprover = approvers.some((u) => u?.accountId === me.accountId);
-  const canApprove =
-    statusName === REQUIRED_STATUS && approvers.length > 0 && currentUserIsApprover;
+  const currentUserIsApprover = approvers.some(u => u?.accountId === me.accountId);
+  const canApprove = statusName === REQUIRED_STATUS && approvers.length > 0 && currentUserIsApprover;
 
   return {
     statusName,
     approvers,
     approvedCount: votes.length,
     totalApprovers: approvers.length,
-    hasVoted,
+    hasVoted: votes.includes(me.accountId),
     canApprove,
   };
 });
 
-// Resolver: approve issue
+// Approve action
 resolver.define('approveIssue', async ({ payload }) => {
   const idOrKey = payload.issueKey || payload.issueId;
-  if (!idOrKey) throw new Error('Missing issueKey/issueId in request');
+  if (!idOrKey) throw new Error('Missing issueKey/issueId');
 
-  // Who is the user?
   const meRes = await api.asUser().requestJira(route`/rest/api/3/myself`);
   const me = await meRes.json();
 
   const issue = await getIssueByKeyOrId(idOrKey);
   const statusName = issue?.fields?.status?.name || 'Unknown';
-  const approvers = Array.isArray(issue?.fields?.[APPROVER_CF])
-    ? issue.fields[APPROVER_CF]
-    : [];
+  const approvers  = Array.isArray(issue?.fields?.[APPROVER_CF]) ? issue.fields[APPROVER_CF] : [];
 
-  // Validate server-side
   if (statusName !== REQUIRED_STATUS) {
     throw new Error(`Must be in "${REQUIRED_STATUS}" to approve (current: ${statusName})`);
   }
-  if (approvers.length === 0 || !approvers.some((u) => u?.accountId === me.accountId)) {
+  if (approvers.length === 0 || !approvers.some(u => u?.accountId === me.accountId)) {
     throw new Error('Only listed approvers can approve this issue');
   }
 
-  // Find transition to Approved
+  // Find transition → Approved
   const transRes = await api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/transitions`);
   const transitions = (await transRes.json())?.transitions || [];
-  const target = transitions.find(
-    (t) => String(t?.to?.name || '').toLowerCase() === TARGET_STATUS.toLowerCase()
-  );
+  const target = transitions.find(t => String(t?.to?.name || '').toLowerCase() === 'approved');
   if (!target) throw new Error(`No transition to "${TARGET_STATUS}" available`);
 
-  // Perform transition
+  // Do transition
   await api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/transitions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ transition: { id: target.id } }),
   });
 
-  // Update Approval Date
-  const now = new Date().toISOString();
+  // Set Approval Date (ISO is fine; if your field is date-only, send YYYY-MM-DD instead)
+  const nowIso = new Date().toISOString();
   await api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fields: { [APPROVAL_DATE_CF]: now } }),
+    body: JSON.stringify({ fields: { [APPROVAL_DATE_CF]: nowIso } }),
   });
 
   // Record vote
   let votes = await getIssuePropertyOrEmpty(issue.id, APPROVAL_PROPERTY_KEY);
   if (!votes.includes(me.accountId)) votes.push(me.accountId);
-  await api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/properties/${APPROVAL_PROPERTY_KEY}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(votes),
-  });
 
-  // Return message for UI
+  await api.asUser().requestJira(
+    route`/rest/api/3/issue/${issue.id}/properties/${APPROVAL_PROPERTY_KEY}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(votes),
+    }
+  );
+
   return { message: `Approved by ${me.displayName}` };
 });
 
