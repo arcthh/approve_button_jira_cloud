@@ -3,6 +3,7 @@ import api, { route } from '@forge/api';
 
 const resolver = new Resolver();
 
+// Your fields & workflow names
 const APPROVER_CF           = 'customfield_10003';   // Approvers (multi-user)
 const APPROVAL_DATE_CF      = 'customfield_15694';   // Approval Date (date/datetime)
 const APPROVAL_GIVEN_BY_CF  = 'customfield_15826';   // Approval given by (single-user)
@@ -10,20 +11,26 @@ const REQUIRED_STATUS       = 'Ready for Review';
 const TARGET_STATUS         = 'Approved';
 const APPROVAL_PROPERTY_KEY = 'approvalVotes';
 
+// -------- helpers (safe error text; lean fetch) --------
+async function safeBody(res) {
+  try {
+    if (typeof res.text === 'function') return await res.text();
+    if (typeof res.json === 'function') return JSON.stringify(await res.json());
+  } catch {}
+  return '';
+}
+
 async function assertOk(res, label) {
-  if (!res.ok) throw new Error(`${label} failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const body = await safeBody(res);
+    throw new Error(`${label} failed: ${res.status}${body ? ` – ${body}` : ''}`);
+  }
   return res;
 }
 
-// Fetch ONLY the fields we need to render the panel.
-// This reduces response size and pressure on Jira.
+// Fetch only the fields we need
 async function getIssueByKeyOrId(idOrKey) {
-  const fields = [
-    'status',
-    APPROVER_CF,
-    APPROVAL_DATE_CF,
-    APPROVAL_GIVEN_BY_CF,
-  ].join(',');
+  const fields = ['status', APPROVER_CF, APPROVAL_DATE_CF, APPROVAL_GIVEN_BY_CF].join(',');
   const res = await api.asUser().requestJira(
     route`/rest/api/3/issue/${idOrKey}?fields=${fields}`
   );
@@ -63,7 +70,9 @@ async function updateIssueFields(issueId, fieldsObj) {
   await assertOk(res, 'Issue update');
 }
 
-// Read-only view model
+// -------- resolvers --------
+
+// Read-only model for UI
 resolver.define('getIssueData', async ({ payload }) => {
   const idOrKey = payload.issueKey || payload.issueId;
   if (!idOrKey) throw new Error('Missing issueKey/issueId');
@@ -72,7 +81,6 @@ resolver.define('getIssueData', async ({ payload }) => {
 
   const statusName = issue?.fields?.status?.name || 'Unknown';
   const approvers  = Array.isArray(issue?.fields?.[APPROVER_CF]) ? issue.fields[APPROVER_CF] : [];
-
   const approvalGivenBy = issue?.fields?.[APPROVAL_GIVEN_BY_CF] || null;
   const approvalDate    = issue?.fields?.[APPROVAL_DATE_CF] || null;
 
@@ -93,12 +101,12 @@ resolver.define('getIssueData', async ({ payload }) => {
   };
 });
 
-// Transition + fields + vote
+// Transition + set fields + vote (with readable errors)
 resolver.define('approveIssue', async ({ payload }) => {
   const idOrKey = payload.issueKey || payload.issueId;
   if (!idOrKey) throw new Error('Missing issueKey/issueId');
 
-  const me    = await getMyself();
+  const me = await getMyself();
   const issue = await getIssueByKeyOrId(idOrKey);
 
   const statusName = issue?.fields?.status?.name || 'Unknown';
@@ -107,72 +115,58 @@ resolver.define('approveIssue', async ({ payload }) => {
   if (statusName !== REQUIRED_STATUS) {
     throw new Error(`Must be in "${REQUIRED_STATUS}" to approve (current: ${statusName})`);
   }
-  if (approvers.length === 0 || !approvers.some(u => u?.accountId === me.accountId)) {
+  if (approvers.length === 0 || !approvers.some((u) => u?.accountId === me.accountId)) {
     throw new Error('Only listed approvers can approve this issue');
   }
 
-  // Find transition → Approved
-  const trRes = await api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/transitions`);
-  await assertOk(trRes, 'Transitions fetch');
+  // Fetch transitions (expand fields in case a transition screen requires them)
+  const trRes = await api
+    .asUser()
+    .requestJira(route`/rest/api/3/issue/${issue.id}/transitions?expand=transitions.fields`);
+  if (!trRes.ok) {
+    throw new Error(`Transitions fetch failed: ${trRes.status} – ${await safeBody(trRes)}`);
+  }
   const transitions = (await trRes.json())?.transitions || [];
-  const availableTargets = transitions.map(t => t?.to?.name).filter(Boolean);
-  const target = transitions.find(t => String(t?.to?.name || '').toLowerCase() === 'approved');
+  const availableTargets = transitions.map((t) => t?.to?.name).filter(Boolean);
+  const target = transitions.find(
+    (t) => String(t?.to?.name || '').toLowerCase() === TARGET_STATUS.toLowerCase()
+  );
   if (!target) {
-    throw new Error(`No transition to "Approved" from "${statusName}". Available: ${availableTargets.join(', ') || '(none)'}`);
+    throw new Error(
+      `No transition to "${TARGET_STATUS}" from "${statusName}". ` +
+      `Available: ${availableTargets.join(', ') || '(none)'}`
+    );
   }
 
-  await assertOk(api.asUser().requestJira(route`/rest/api/3/issue/${issue.id}/transitions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ transition: { id: target.id } }),
-  }), 'Transition');
+  // Perform transition
+  const doTrans = await api.asUser().requestJira(
+    route`/rest/api/3/issue/${issue.id}/transitions`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transition: { id: target.id } }),
+    }
+  );
+  if (!doTrans.ok) {
+    // Show detailed reason if Jira provided one (validators, required fields, etc.)
+    throw new Error(`Transition failed: ${doTrans.status} – ${await safeBody(doTrans)}`);
+  }
 
-  // Write fields (ISO for datetime; switch to YYYY-MM-DD if your field is date-only)
-  const nowIso = new Date().toISOString();
+  // Approval Date + Approval given by (current user)
+  const nowIso = new Date().toISOString(); // if your field is date-only, convert to YYYY-MM-DD
   await updateIssueFields(issue.id, {
     [APPROVAL_DATE_CF]: nowIso,
     [APPROVAL_GIVEN_BY_CF]: { accountId: me.accountId },
   });
 
-  // Record vote
-  const votes = await getIssuePropertyOrEmpty(issue.id, APPROVAL_PROPERTY_KEY);
+  // Record vote (unique list)
+  let votes = await getIssuePropertyOrEmpty(issue.id, APPROVAL_PROPERTY_KEY);
   if (!votes.includes(me.accountId)) {
     votes.push(me.accountId);
     await putIssueProperty(issue.id, APPROVAL_PROPERTY_KEY, votes);
   }
 
   return { message: `Approved by ${me.displayName}` };
-});
-
-/**
- * Optional helper you can call from automation or a small UI control
- * when the issue re-enters "Ready for Review" to clear approval artifacts.
- */
-resolver.define('resetApprovalOnReady', async ({ payload }) => {
-  const idOrKey = payload.issueKey || payload.issueId;
-  if (!idOrKey) throw new Error('Missing issueKey/issueId');
-
-  const issue = await getIssueByKeyOrId(idOrKey);
-  const statusName = issue?.fields?.status?.name || 'Unknown';
-  if (statusName !== REQUIRED_STATUS) {
-    return { reset: false, reason: `Status is ${statusName}` };
-  }
-
-  const currentDate  = issue?.fields?.[APPROVAL_DATE_CF] || null;
-  const currentBy    = issue?.fields?.[APPROVAL_GIVEN_BY_CF] || null;
-  const votes        = await getIssuePropertyOrEmpty(issue.id, APPROVAL_PROPERTY_KEY);
-
-  if (!currentDate && !currentBy && votes.length === 0) {
-    return { reset: false, reason: 'Already clear' };
-  }
-
-  await updateIssueFields(issue.id, {
-    [APPROVAL_DATE_CF]: null,
-    [APPROVAL_GIVEN_BY_CF]: null,
-  });
-  await putIssueProperty(issue.id, APPROVAL_PROPERTY_KEY, []);
-
-  return { reset: true };
 });
 
 export const handler = resolver.getDefinitions();
