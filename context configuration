@@ -1,0 +1,144 @@
+/** @jsxImportSource @forge/react */
+import React, { useEffect, useState } from 'react';
+import {
+  Form, Label, TextField, useForm, FormSection, FormFooter,
+  LoadingButton, Button, ButtonGroup, Select, Text
+} from '@forge/react';
+import { view, requestJira } from '@forge/bridge';
+
+const TRANSITION_TYPE_OPTIONS = [
+  { label: 'First', value: 'first' },
+  { label: 'Last',  value: 'last'  },
+];
+
+const ContextConfig = () => {
+  const [extensionData, setExtensionData] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [statusOptions, setStatusOptions] = useState([]);
+  const [configuration, setConfiguration] = useState(() => ({
+    regex: '^[A-Za-z]+$',
+    sourceStatus: '',
+    destinationStatus: '',
+    transitionType: 'first',
+  }));
+
+  const { handleSubmit, register, getFieldId, getValues, setValue } = useForm();
+
+  // Fetch statuses dynamically from Jira (once)
+  useEffect(() => {
+    const fetchStatuses = async () => {
+      try {
+        const response = await requestJira('/rest/api/3/status', {
+          method: 'GET',
+          headers: { 'Accept': 'application/json' },
+        });
+        const statuses = await response.json();
+        setStatusOptions(
+          (Array.isArray(statuses) ? statuses : []).map((status) => ({
+            label: status.name,
+            value: status.name, // keep "name" since your view compares by name
+          }))
+        );
+      } catch (e) {
+        setStatusOptions([]);
+        // Optional: console.error('Failed to load statuses', e);
+      }
+    };
+    fetchStatuses();
+  }, []);
+
+  // Load existing configuration if present (hydrates form)
+  useEffect(() => {
+    (async () => {
+      const { extension } = await view.getContext();
+      setExtensionData(extension);
+      const cfg = extension?.configuration || {};
+      const hydrated = {
+        regex: cfg.regex ?? '^[A-Za-z]+$',
+        sourceStatus: cfg.sourceStatus ?? '',
+        destinationStatus: cfg.destinationStatus ?? '',
+        transitionType: cfg.transitionType ?? 'first',
+      };
+      setConfiguration(hydrated);
+
+      // hydrate useForm controlled values
+      setValue('regex', hydrated.regex);
+      setValue('sourceStatus', hydrated.sourceStatus);
+      setValue('destinationStatus', hydrated.destinationStatus);
+      setValue('transitionType', hydrated.transitionType);
+    })();
+  }, [setValue]);
+
+  // Handle form submission and save configuration
+  const onSubmit = async () => {
+    setIsLoading(true);
+    try {
+      const { regex, sourceStatus, destinationStatus, transitionType } = getValues();
+
+      // sanity log
+      // console.log('Submitting config:', { regex, sourceStatus, destinationStatus, transitionType });
+
+      await view.submit({
+        configuration: {
+          regex: regex || '^[A-Za-z]+$',
+          sourceStatus,
+          destinationStatus,
+          transitionType: transitionType || 'first',
+        },
+      });
+    } catch (e) {
+      // console.error(e);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Wait until context is loaded so getValues() reflects hydration
+  if (!extensionData) {
+    return <Text>Loading…</Text>;
+  }
+
+  return (
+    <Form onSubmit={handleSubmit(onSubmit)}>
+      <FormSection>
+        <Label labelFor={getFieldId('regex')}>Validation RegEx</Label>
+        <TextField
+          {...register('regex')}
+          value={getValues('regex')}
+        />
+
+        <Label labelFor={getFieldId('sourceStatus')}>Source Status</Label>
+        <Select
+          {...register('sourceStatus')}
+          options={statusOptions}
+          value={getValues('sourceStatus')}
+        />
+
+        <Label labelFor={getFieldId('destinationStatus')}>Destination Status</Label>
+        <Select
+          {...register('destinationStatus')}
+          options={statusOptions}
+          value={getValues('destinationStatus')}
+        />
+
+        <Label labelFor={getFieldId('transitionType')}>Transition Type</Label>
+        <Select
+          {...register('transitionType')}
+          options={TRANSITION_TYPE_OPTIONS}
+          value={getValues('transitionType')}
+        />
+      </FormSection>
+
+      <FormFooter align="start">
+        <ButtonGroup>
+          <Button appearance="subtle" onClick={() => view.close()}>Close</Button>
+          <LoadingButton appearance="primary" type="submit" isLoading={isLoading}>
+            Save
+          </LoadingButton>
+        </ButtonGroup>
+      </FormFooter>
+    </Form>
+  );
+};
+
+export default ContextConfig;
