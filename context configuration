@@ -1,6 +1,5 @@
-/** @jsxImportSource @forge/react */
 import React, { useEffect, useState } from 'react';
-import {
+import ForgeReconciler, {
   Form, Label, TextField, useForm, FormSection, FormFooter,
   LoadingButton, Button, ButtonGroup, Select, Text
 } from '@forge/react';
@@ -28,20 +27,13 @@ const ContextConfig = () => {
   useEffect(() => {
     const fetchStatuses = async () => {
       try {
-        const response = await requestJira('/rest/api/3/status', {
-          method: 'GET',
-          headers: { 'Accept': 'application/json' },
-        });
+        const response = await requestJira('/rest/api/3/status', { method: 'GET', headers: { Accept: 'application/json' }});
         const statuses = await response.json();
         setStatusOptions(
-          (Array.isArray(statuses) ? statuses : []).map((status) => ({
-            label: status.name,
-            value: status.name, // keep "name" since your view compares by name
-          }))
+          (Array.isArray(statuses) ? statuses : []).map(s => ({ label: s.name, value: s.name }))
         );
-      } catch (e) {
+      } catch (_) {
         setStatusOptions([]);
-        // Optional: console.error('Failed to load statuses', e);
       }
     };
     fetchStatuses();
@@ -52,6 +44,7 @@ const ContextConfig = () => {
     (async () => {
       const { extension } = await view.getContext();
       setExtensionData(extension);
+
       const cfg = extension?.configuration || {};
       const hydrated = {
         regex: cfg.regex ?? '^[A-Za-z]+$',
@@ -61,7 +54,6 @@ const ContextConfig = () => {
       };
       setConfiguration(hydrated);
 
-      // hydrate useForm controlled values
       setValue('regex', hydrated.regex);
       setValue('sourceStatus', hydrated.sourceStatus);
       setValue('destinationStatus', hydrated.destinationStatus);
@@ -69,15 +61,11 @@ const ContextConfig = () => {
     })();
   }, [setValue]);
 
-  // Handle form submission and save configuration
+  // Save configuration back to context
   const onSubmit = async () => {
     setIsLoading(true);
     try {
       const { regex, sourceStatus, destinationStatus, transitionType } = getValues();
-
-      // sanity log
-      // console.log('Submitting config:', { regex, sourceStatus, destinationStatus, transitionType });
-
       await view.submit({
         configuration: {
           regex: regex || '^[A-Za-z]+$',
@@ -86,59 +74,42 @@ const ContextConfig = () => {
           transitionType: transitionType || 'first',
         },
       });
-    } catch (e) {
-      // console.error(e);
     } finally {
       setIsLoading(false);
     }
   };
 
-  // Wait until context is loaded so getValues() reflects hydration
-  if (!extensionData) {
-    return <Text>Loading…</Text>;
-  }
+  if (!extensionData) return <Text>Loading…</Text>;
 
   return (
     <Form onSubmit={handleSubmit(onSubmit)}>
       <FormSection>
         <Label labelFor={getFieldId('regex')}>Validation RegEx</Label>
-        <TextField
-          {...register('regex')}
-          value={getValues('regex')}
-        />
+        <TextField {...register('regex')} value={getValues('regex')} />
 
         <Label labelFor={getFieldId('sourceStatus')}>Source Status</Label>
-        <Select
-          {...register('sourceStatus')}
-          options={statusOptions}
-          value={getValues('sourceStatus')}
-        />
+        <Select {...register('sourceStatus')} options={statusOptions} value={getValues('sourceStatus')} />
 
         <Label labelFor={getFieldId('destinationStatus')}>Destination Status</Label>
-        <Select
-          {...register('destinationStatus')}
-          options={statusOptions}
-          value={getValues('destinationStatus')}
-        />
+        <Select {...register('destinationStatus')} options={statusOptions} value={getValues('destinationStatus')} />
 
         <Label labelFor={getFieldId('transitionType')}>Transition Type</Label>
-        <Select
-          {...register('transitionType')}
-          options={TRANSITION_TYPE_OPTIONS}
-          value={getValues('transitionType')}
-        />
+        <Select {...register('transitionType')} options={TRANSITION_TYPE_OPTIONS} value={getValues('transitionType')} />
       </FormSection>
 
       <FormFooter align="start">
         <ButtonGroup>
           <Button appearance="subtle" onClick={() => view.close()}>Close</Button>
-          <LoadingButton appearance="primary" type="submit" isLoading={isLoading}>
-            Save
-          </LoadingButton>
+          <LoadingButton appearance="primary" type="submit" isLoading={isLoading}>Save</LoadingButton>
         </ButtonGroup>
       </FormFooter>
     </Form>
   );
 };
 
-export default ContextConfig;
+// 👇 This is the important part: render entry point for UI Kit 2 resources.
+ForgeReconciler.render(
+  <React.StrictMode>
+    <ContextConfig />
+  </React.StrictMode>
+);
