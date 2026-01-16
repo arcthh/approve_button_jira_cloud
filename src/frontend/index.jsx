@@ -62,6 +62,7 @@ function App() {
     estimates: {},
     participants: [],
   });
+  const [participantsSelection, setParticipantsSelection] = useState([]);
   const [submitting, setSubmitting] = useState(false);
   const [participantsSaving, setParticipantsSaving] = useState(false);
 
@@ -102,6 +103,12 @@ function App() {
     () => pokerState?.participants ?? [],
     [pokerState]
   );
+
+  useEffect(() => {
+    setParticipantsSelection(
+      allowedParticipants.map((participant) => participant.accountId)
+    );
+  }, [allowedParticipants]);
 
   const allowedAccountIds = useMemo(
     () => new Set(allowedParticipants.map((participant) => participant.accountId)),
@@ -156,13 +163,17 @@ function App() {
   }, []);
 
   const handleParticipantsSubmit = useCallback(
-    async (formData) => {
+    async (formData = {}) => {
       if (!issueKey) return;
 
       try {
         setParticipantsSaving(true);
         setError(null);
-        const participants = await resolveParticipants(formData.pokerParticipants);
+        const selection =
+          participantsSelection.length > 0
+            ? participantsSelection
+            : formData?.pokerParticipants;
+        const participants = await resolveParticipants(selection);
         const nextState = await invoke('setPokerParticipants', {
           issueKey,
           participants,
@@ -174,7 +185,7 @@ function App() {
         setParticipantsSaving(false);
       }
     },
-    [issueKey, resolveParticipants]
+    [issueKey, participantsSelection, resolveParticipants]
   );
 
   const handleAllowAll = useCallback(async () => {
@@ -279,7 +290,8 @@ function App() {
           name="pokerParticipants"
           label="Allowed participants"
           isMulti
-          defaultValue={allowedParticipants.map((participant) => participant.accountId)}
+          value={participantsSelection}
+          onChange={(value) => setParticipantsSelection(normalizePickerValues(value))}
           placeholder="Search for users"
         />
         <FormFooter>
