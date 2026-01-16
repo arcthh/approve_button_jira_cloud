@@ -10,6 +10,7 @@ import ForgeReconciler, {
   Stack,
   Text,
   TextField,
+  UserPicker,
   useProductContext,
 } from '@forge/react';
 import { invoke, requestJira } from '@forge/bridge';
@@ -23,6 +24,18 @@ const formatRevealed = (entries) =>
   entries
     .map((entry) => `${entry.displayName} = ${entry.estimate}`)
     .join(DELIMITER) || 'No estimates yet.';
+
+const formatAllowedParticipants = (entries) =>
+  entries.map((entry) => entry.displayName).join(DELIMITER) ||
+  'Anyone with access can participate.';
+
+const normalizePickerValues = (value) => {
+  if (!value) {
+    return [];
+  }
+
+  return Array.isArray(value) ? value : [value];
+};
 
 const fetchJson = async (path, init) => {
   const res = await requestJira(path, init);
@@ -44,8 +57,13 @@ function App() {
   const [error, setError] = useState(null);
   const [currentUser, setCurrentUser] = useState(null);
   const [estimate, setEstimate] = useState('');
-  const [pokerState, setPokerState] = useState({ revealed: false, estimates: {} });
+  const [pokerState, setPokerState] = useState({
+    revealed: false,
+    estimates: {},
+    participants: [],
+  });
   const [submitting, setSubmitting] = useState(false);
+  const [participantsSaving, setParticipantsSaving] = useState(false);
 
   const load = useCallback(async () => {
     if (!issueKey) {
@@ -80,8 +98,109 @@ function App() {
     );
   }, [pokerState]);
 
+  const allowedParticipants = useMemo(
+    () => pokerState?.participants ?? [],
+    [pokerState]
+  );
+
+  const allowedAccountIds = useMemo(
+    () => new Set(allowedParticipants.map((participant) => participant.accountId)),
+    [allowedParticipants]
+  );
+
+  const isParticipantAllowed =
+    allowedParticipants.length === 0 ||
+    (currentUser?.accountId && allowedAccountIds.has(currentUser.accountId));
+
+  const resolveParticipants = useCallback(async (selection) => {
+    const values = normalizePickerValues(selection);
+    const participants = new Map();
+    const missing = [];
+
+    values.forEach((value) => {
+      if (!value) {
+        return;
+      }
+
+      if (typeof value === 'string') {
+        missing.push(value);
+        return;
+      }
+
+      const accountId = value.id || value.accountId;
+      const displayName = value.name || value.displayName;
+      if (accountId && displayName) {
+        participants.set(accountId, displayName);
+      } else if (accountId) {
+        missing.push(accountId);
+      }
+    });
+
+    if (missing.length > 0) {
+      const fetched = await Promise.all(
+        missing.map((accountId) =>
+          fetchJson(`/rest/api/3/user?accountId=${encodeURIComponent(accountId)}`)
+        )
+      );
+      fetched.forEach((user) => {
+        if (user?.accountId && user?.displayName) {
+          participants.set(user.accountId, user.displayName);
+        }
+      });
+    }
+
+    return Array.from(participants, ([accountId, displayName]) => ({
+      accountId,
+      displayName,
+    }));
+  }, []);
+
+  const handleParticipantsSubmit = useCallback(
+    async (formData) => {
+      if (!issueKey) return;
+
+      try {
+        setParticipantsSaving(true);
+        setError(null);
+        const participants = await resolveParticipants(formData.pokerParticipants);
+        const nextState = await invoke('setPokerParticipants', {
+          issueKey,
+          participants,
+        });
+        setPokerState(nextState);
+      } catch (e) {
+        setError(e.message || String(e));
+      } finally {
+        setParticipantsSaving(false);
+      }
+    },
+    [issueKey, resolveParticipants]
+  );
+
+  const handleAllowAll = useCallback(async () => {
+    if (!issueKey) return;
+
+    try {
+      setParticipantsSaving(true);
+      setError(null);
+      const nextState = await invoke('setPokerParticipants', {
+        issueKey,
+        participants: [],
+      });
+      setPokerState(nextState);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setParticipantsSaving(false);
+    }
+  }, [issueKey]);
+
   const handleSubmit = useCallback(async () => {
     if (!issueKey) return;
+    if (!isParticipantAllowed) {
+      setError('You are not allowed to participate in this poker session.');
+      return;
+    }
     if (!estimate) {
       setError('Please enter an estimate before submitting.');
       return;
@@ -103,7 +222,7 @@ function App() {
     } finally {
       setSubmitting(false);
     }
-  }, [issueKey, estimate, currentUser]);
+  }, [issueKey, estimate, currentUser, isParticipantAllowed]);
 
   const handleReveal = useCallback(async () => {
     if (!issueKey) return;
@@ -148,6 +267,54 @@ function App() {
         </SectionMessage>
       ) : null}
 
+      <SectionMessage title="Poker participation" appearance="information">
+        <Text>
+          Choose who can participate in this poker session. Leave the list empty
+          to allow anyone with access.
+        </Text>
+      </SectionMessage>
+
+      <Form onSubmit={handleParticipantsSubmit}>
+        <UserPicker
+          name="pokerParticipants"
+          label="Allowed participants"
+          isMulti
+          defaultValue={allowedParticipants.map((participant) => participant.accountId)}
+          placeholder="Search for users"
+        />
+        <FormFooter>
+          <Button
+            appearance="primary"
+            type="submit"
+            isDisabled={participantsSaving}
+          >
+            {participantsSaving ? 'Saving…' : 'Save participants'}
+          </Button>
+          <Button
+            appearance="subtle"
+            type="button"
+            onClick={handleAllowAll}
+            isDisabled={participantsSaving}
+          >
+            Allow all
+          </Button>
+        </FormFooter>
+      </Form>
+
+      <Stack space="small">
+        <Text>Participants allowed:</Text>
+        <Text>{formatAllowedParticipants(allowedParticipants)}</Text>
+      </Stack>
+
+      {!isParticipantAllowed ? (
+        <SectionMessage title="Participation restricted" appearance="warning">
+          <Text>
+            You are not on the participant list, so you cannot submit an
+            estimate.
+          </Text>
+        </SectionMessage>
+      ) : null}
+
       <Form onSubmit={handleSubmit}>
         <Label labelFor="poker-estimate">Poker: enter your estimate</Label>
         <TextField
@@ -155,9 +322,14 @@ function App() {
           value={estimate}
           onChange={(e) => setEstimate(e.target.value)}
           placeholder="e.g. 3"
+          isDisabled={!isParticipantAllowed || submitting}
         />
         <FormFooter>
-          <Button appearance="primary" type="submit" isDisabled={submitting}>
+          <Button
+            appearance="primary"
+            type="submit"
+            isDisabled={!isParticipantAllowed || submitting}
+          >
             {submitting ? 'Saving…' : 'Submit estimate'}
           </Button>
         </FormFooter>
