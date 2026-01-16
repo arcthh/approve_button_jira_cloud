@@ -1,33 +1,29 @@
 modules:
   jira:issuePanel:
-    - key: approve-button-jira-cloud-hello-world-issue-panel
+    - key: poker-estimates-issue-panel
       resource: main
       resolver:
         function: resolver
       render: native
-      title: approve_button_jira_cloud
+      title: Poker Estimates
       icon: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
   function:
     - key: resolver
       handler: index.handler
+
 resources:
   - key: main
     path: src/frontend/index.jsx
 
 permissions:
   scopes:
-    - read:jira-work # To read Jira issues and related data
-    - write:jira-work # To write to Jira issues and related data
-    - read:jira-user # To read user information and properties
-    - manage:jira-project # To read and write project properties
+    - read:jira-work
+    - write:jira-work
+    - read:jira-user
+
 app:
   runtime:
     name: nodejs22.x
     memoryMB: 256
     architecture: arm64
   id: ari:cloud:ecosystem::app/fd8f1ef0-de8b-40db-820f-0b6d998c4cad
-
-#finding field IDs using a Jira REST API
-# https://smu-arath.atlassian.net/rest/api/2/issue/createmeta?expand=projects.issuetypes.fields&projectKeys=SCRUM
-#approval date is customfield_10067, operations is set and must be automatically set when button is clicked
-#approvers is customfield_10003
